@@ -24,11 +24,13 @@ using Microsoft.EntityFrameworkCore.Storage;
 
 namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
 {
-    public class RelationalShapedQueryCompilingExpressionVisitor : ShapedQueryCompilingExpressionVisitor
+    public partial class RelationalShapedQueryCompilingExpressionVisitor : ShapedQueryCompilingExpressionVisitor
     {
         private readonly IQuerySqlGeneratorFactory2 _querySqlGeneratorFactory;
         private readonly Type _contextType;
         private readonly IDiagnosticsLogger<DbLoggerCategory.Query> _logger;
+        private static ParameterExpression _resultCoordinatorParameter
+            = Expression.Parameter(typeof(ResultCoordinator), "resultCoordinator");
 
         public RelationalShapedQueryCompilingExpressionVisitor(
             IEntityMaterializerSource entityMaterializerSource,
@@ -57,7 +59,8 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
             var shaperLambda = Expression.Lambda(
                 shaperBody,
                 QueryCompilationContext2.QueryContextParameter,
-                RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter);
+                RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter,
+                _resultCoordinatorParameter);
 
             if (Async)
             {
@@ -81,6 +84,12 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
                 Expression.Constant(_logger));
         }
 
+        private class ResultCoordinator
+        {
+            public bool? HasNext { get; set; }
+            public object[] KeyValues { get; set; }
+        }
+
         private class IncludeCompilingExpressionVisitor : ExpressionVisitor
         {
             private readonly bool _tracking;
@@ -98,13 +107,14 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
                 QueryContext queryContext,
                 DbDataReader dbDataReader,
                 TEntity entity,
-                Func<QueryContext, DbDataReader, TIncludedEntity> innerShaper,
+                Func<QueryContext, DbDataReader, ResultCoordinator, TIncludedEntity> innerShaper,
                 INavigation navigation,
                 INavigation inverseNavigation,
                 Action<TEntity, TIncludedEntity> fixup,
-                bool trackingQuery)
+                bool trackingQuery,
+                ResultCoordinator resultCoordinator)
             {
-                var relatedEntity = innerShaper(queryContext, dbDataReader);
+                var relatedEntity = innerShaper(queryContext, dbDataReader, resultCoordinator);
 
                 if (!trackingQuery)
                 {
@@ -120,6 +130,97 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
                 }
             }
 
+            private static readonly MethodInfo _includeCollectionMethodInfo
+                = typeof(IncludeCompilingExpressionVisitor).GetTypeInfo()
+                    .GetDeclaredMethod(nameof(IncludeCollection));
+
+            private static void IncludeCollection<TEntity, TIncludedEntity>(
+                QueryContext queryContext,
+                DbDataReader dbDataReader,
+                TEntity entity,
+                Func<QueryContext, DbDataReader, object[]> outerKeySelector,
+                Func<QueryContext, DbDataReader, object[]> innerKeySelector,
+                Func<QueryContext, DbDataReader, ResultCoordinator, TIncludedEntity> innerShaper,
+                INavigation navigation,
+                INavigation inverseNavigation,
+                Action<TEntity, TIncludedEntity> fixup,
+                bool trackingQuery,
+                ResultCoordinator resultCoordinator)
+            {
+                if (entity is null)
+                {
+                    return;
+                }
+
+                if (trackingQuery)
+                {
+                    queryContext.StateManager.TryGetEntry(entity).SetIsLoaded(navigation);
+                }
+                else
+                {
+                    SetIsLoadedNoTracking(entity, navigation);
+                }
+
+
+                var innerKey = innerKeySelector(queryContext, dbDataReader);
+                var outerKey = outerKeySelector(queryContext, dbDataReader);
+
+                resultCoordinator.HasNext = null;
+                var relatedEntity = innerShaper(queryContext, dbDataReader, resultCoordinator);
+
+                if (ReferenceEquals(relatedEntity, null))
+                {
+                    navigation.GetCollectionAccessor().GetOrCreate(entity);
+                    return;
+                }
+
+                if (!trackingQuery)
+                {
+                    fixup(entity, relatedEntity);
+                    if (inverseNavigation != null && !inverseNavigation.IsCollection())
+                    {
+                        SetIsLoadedNoTracking(relatedEntity, inverseNavigation);
+                    }
+                }
+
+                if (resultCoordinator.HasNext == false)
+                {
+                    return;
+                }
+
+                while (resultCoordinator.HasNext ?? dbDataReader.Read())
+                {
+                    resultCoordinator.HasNext = null;
+                    var currentOuterKey = outerKeySelector(queryContext, dbDataReader);
+                    if (!StructuralComparisons.StructuralEqualityComparer.Equals(outerKey, currentOuterKey))
+                    {
+                        resultCoordinator.HasNext = true;
+                        break;
+                    }
+
+                    var currentInnerKey = innerKeySelector(queryContext, dbDataReader);
+                    if (StructuralComparisons.StructuralEqualityComparer.Equals(innerKey, currentInnerKey))
+                    {
+                        continue;
+                    }
+
+                    relatedEntity = innerShaper(queryContext, dbDataReader, resultCoordinator);
+                    if (!trackingQuery)
+                    {
+                        fixup(entity, relatedEntity);
+                        if (inverseNavigation != null && !inverseNavigation.IsCollection())
+                        {
+                            SetIsLoadedNoTracking(relatedEntity, inverseNavigation);
+                        }
+                    }
+
+                    if (resultCoordinator.HasNext == false)
+                    {
+                        return;
+                    }
+                }
+            }
+
             private static void SetIsLoadedNoTracking(object entity, INavigation navigation)
             => ((ILazyLoader)((PropertyBase)navigation
                         .DeclaringEntityType
@@ -131,28 +232,68 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
 
             protected override Expression VisitExtension(Expression extensionExpression)
             {
-                if (extensionExpression is IncludeExpression includeExpression
-                    && !includeExpression.Navigation.IsCollection())
+                if (extensionExpression is IncludeExpression includeExpression)
                 {
-                    var entityClrType = includeExpression.EntityExpression.Type;
-                    var relatedEntityClrType = includeExpression.NavigationExpression.Type;
-                    var inverseNavigation = includeExpression.Navigation.FindInverse();
-                    return Expression.Call(
-                        _includeReferenceMethodInfo.MakeGenericMethod(entityClrType, relatedEntityClrType),
-                        QueryCompilationContext2.QueryContextParameter,
-                        RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter,
-                        // We don't need to visit entityExpression since it is supposed to be a parameterExpression only
-                        includeExpression.EntityExpression,
-                        Expression.Constant(
-                            Expression.Lambda(
-                                Visit(includeExpression.NavigationExpression),
-                                QueryCompilationContext2.QueryContextParameter,
-                                RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter).Compile()),
-                        Expression.Constant(includeExpression.Navigation),
-                        Expression.Constant(inverseNavigation, typeof(INavigation)),
-                        Expression.Constant(
-                            GenerateFixup(entityClrType, relatedEntityClrType, includeExpression.Navigation, inverseNavigation).Compile()),
-                        Expression.Constant(_tracking));
+                    if (includeExpression.Navigation.IsCollection())
+                    {
+                        var entityClrType = includeExpression.EntityExpression.Type;
+                        var relatedEntityClrType = includeExpression.NavigationExpression.Type.TryGetSequenceType();
+                        var inverseNavigation = includeExpression.Navigation.FindInverse();
+                        var collectionShaper = (RelationalCollectionShaperExpression)includeExpression.NavigationExpression;
+                        var innerShaper = Visit(collectionShaper.InnerShaper);
+                        return Expression.Call(
+                            _includeCollectionMethodInfo.MakeGenericMethod(entityClrType, relatedEntityClrType),
+                            QueryCompilationContext2.QueryContextParameter,
+                            RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter,
+                            // We don't need to visit entityExpression since it is supposed to be a parameterExpression only
+                            includeExpression.EntityExpression,
+                            Expression.Constant(
+                                Expression.Lambda(
+                                    collectionShaper.OuterKeySelector,
+                                    QueryCompilationContext2.QueryContextParameter,
+                                    RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter).Compile()),
+                            Expression.Constant(
+                                Expression.Lambda(
+                                    collectionShaper.InnerKeySelector,
+                                    QueryCompilationContext2.QueryContextParameter,
+                                    RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter).Compile()),
+                            Expression.Constant(
+                                Expression.Lambda(
+                                    innerShaper,
+                                    QueryCompilationContext2.QueryContextParameter,
+                                    RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter,
+                                    _resultCoordinatorParameter).Compile()),
+                            Expression.Constant(includeExpression.Navigation),
+                            Expression.Constant(inverseNavigation, typeof(INavigation)),
+                            Expression.Constant(
+                                GenerateFixup(entityClrType, relatedEntityClrType, includeExpression.Navigation, inverseNavigation).Compile()),
+                            Expression.Constant(_tracking),
+                            _resultCoordinatorParameter);
+                    }
+                    else
+                    {
+                        var entityClrType = includeExpression.EntityExpression.Type;
+                        var relatedEntityClrType = includeExpression.NavigationExpression.Type;
+                        var inverseNavigation = includeExpression.Navigation.FindInverse();
+                        return Expression.Call(
+                            _includeReferenceMethodInfo.MakeGenericMethod(entityClrType, relatedEntityClrType),
+                            QueryCompilationContext2.QueryContextParameter,
+                            RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter,
+                            // We don't need to visit entityExpression since it is supposed to be a parameterExpression only
+                            includeExpression.EntityExpression,
+                            Expression.Constant(
+                                Expression.Lambda(
+                                    Visit(includeExpression.NavigationExpression),
+                                    QueryCompilationContext2.QueryContextParameter,
+                                    RelationalProjectionBindingRemovingExpressionVisitor.DataReaderParameter,
+                                    _resultCoordinatorParameter).Compile()),
+                            Expression.Constant(includeExpression.Navigation),
+                            Expression.Constant(inverseNavigation, typeof(INavigation)),
+                            Expression.Constant(
+                                GenerateFixup(entityClrType, relatedEntityClrType, includeExpression.Navigation, inverseNavigation).Compile()),
+                            Expression.Constant(_tracking),
+                            _resultCoordinatorParameter);
+                    }
                 }
 
                 return base.VisitExtension(extensionExpression);
@@ -215,7 +356,7 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
         {
             private readonly RelationalQueryContext _relationalQueryContext;
             private readonly SelectExpression _selectExpression;
-            private readonly Func<QueryContext, DbDataReader, Task<T>> _shaper;
+            private readonly Func<QueryContext, DbDataReader, ResultCoordinator, Task<T>> _shaper;
             private readonly QuerySqlGenerator _querySqlGenerator;
             private readonly Type _contextType;
             private readonly IDiagnosticsLogger<DbLoggerCategory.Query> _logger;
@@ -224,7 +365,7 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
                 RelationalQueryContext relationalQueryContext,
                 QuerySqlGenerator querySqlGenerator,
                 SelectExpression selectExpression,
-                Func<QueryContext, DbDataReader, Task<T>> shaper,
+                Func<QueryContext, DbDataReader, ResultCoordinator, Task<T>> shaper,
                 Type contextType,
                 IDiagnosticsLogger<DbLoggerCategory.Query> logger)
             {
@@ -244,9 +385,10 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
             private sealed class AsyncEnumerator : IAsyncEnumerator<T>
             {
                 private RelationalDataReader _dataReader;
+                private ResultCoordinator _resultCoordinator;
                 private readonly RelationalQueryContext _relationalQueryContext;
                 private readonly SelectExpression _selectExpression;
-                private readonly Func<QueryContext, DbDataReader, Task<T>> _shaper;
+                private readonly Func<QueryContext, DbDataReader, ResultCoordinator, Task<T>> _shaper;
                 private readonly QuerySqlGenerator _querySqlGenerator;
                 private readonly Type _contextType;
                 private readonly IDiagnosticsLogger<DbLoggerCategory.Query> _logger;
@@ -290,6 +432,8 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
                                     _relationalQueryContext.ParameterValues,
                                     _relationalQueryContext.CommandLogger,
                                     cancellationToken);
+
+                            _resultCoordinator = new ResultCoordinator();
                         }
                         catch (Exception exception)
                         {
@@ -304,18 +448,26 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
 
                     try
                     {
-                        var hasNext = await _dataReader.ReadAsync(cancellationToken);
+                        if (_resultCoordinator.HasNext == false)
+                        {
+                            Current = default;
+
+                            return false;
+                        }
+
+                        var hasNext = _resultCoordinator.HasNext ?? await _dataReader.ReadAsync(cancellationToken);
+
+                        _resultCoordinator.HasNext = null;
 
                         Current
                             = hasNext
-                                ? await _shaper(_relationalQueryContext, _dataReader.DbDataReader)
+                                ? await _shaper(_relationalQueryContext, _dataReader.DbDataReader, _resultCoordinator)
                                 : default;
 
                         return hasNext;
                     }
                     catch (Exception exception)
                     {
-
                         _logger.QueryIterationFailed(_contextType, exception);
 
                         throw;
@@ -328,7 +480,7 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
         {
             private readonly RelationalQueryContext _relationalQueryContext;
             private readonly SelectExpression _selectExpression;
-            private readonly Func<QueryContext, DbDataReader, T> _shaper;
+            private readonly Func<QueryContext, DbDataReader, ResultCoordinator, T> _shaper;
             private readonly QuerySqlGenerator _querySqlGenerator;
             private readonly Type _contextType;
             private readonly IDiagnosticsLogger<DbLoggerCategory.Query> _logger;
@@ -336,7 +488,7 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
             public QueryingEnumerable(RelationalQueryContext relationalQueryContext,
                 QuerySqlGenerator querySqlGenerator,
                 SelectExpression selectExpression,
-                Func<QueryContext, DbDataReader, T> shaper,
+                Func<QueryContext, DbDataReader, ResultCoordinator, T> shaper,
                 Type contextType,
                 IDiagnosticsLogger<DbLoggerCategory.Query> logger)
             {
@@ -354,9 +506,10 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
             private sealed class Enumerator : IEnumerator<T>
             {
                 private RelationalDataReader _dataReader;
+                private ResultCoordinator _resultCoordinator;
                 private readonly RelationalQueryContext _relationalQueryContext;
                 private readonly SelectExpression _selectExpression;
-                private readonly Func<QueryContext, DbDataReader, T> _shaper;
+                private readonly Func<QueryContext, DbDataReader, ResultCoordinator, T> _shaper;
                 private readonly QuerySqlGenerator _querySqlGenerator;
                 private readonly Type _contextType;
                 private readonly IDiagnosticsLogger<DbLoggerCategory.Query> _logger;
@@ -401,6 +554,8 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
                                     _relationalQueryContext.Connection,
                                     _relationalQueryContext.ParameterValues,
                                     _relationalQueryContext.CommandLogger);
+
+                            _resultCoordinator = new ResultCoordinator();
                         }
                         catch (Exception exception)
                         {
@@ -415,18 +570,26 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
 
                     try
                     {
-                        var hasNext = _dataReader.Read();
+                        if (_resultCoordinator.HasNext == false)
+                        {
+                            Current = default;
+
+                            return false;
+                        }
+
+                        var hasNext = _resultCoordinator.HasNext ?? _dataReader.Read();
+
+                        _resultCoordinator.HasNext = null;
 
                         Current
-                        = hasNext
-                            ? _shaper(_relationalQueryContext, _dataReader.DbDataReader)
-                            : default;
+                            = hasNext
+                                ? _shaper(_relationalQueryContext, _dataReader.DbDataReader, _resultCoordinator)
+                                : default;
 
                         return hasNext;
                     }
                     catch (Exception exception)
                     {
-
                         _logger.QueryIterationFailed(_contextType, exception);
 
                         throw;
@@ -507,6 +670,16 @@ namespace Microsoft.EntityFrameworkCore.Relational.Query.Pipeline
                         IsNullableProjection(projection),
                         projection.Expression.TypeMapping,
                         projectionBindingExpression.Type);
+                }
+
+                if (extensionExpression is RelationalCollectionShaperExpression relationalCollectionShaperExpression)
+                {
+                    return new RelationalCollectionShaperExpression(
+                        relationalCollectionShaperExpression.Projection,
+                        Visit(relationalCollectionShaperExpression.OuterKeySelector),
+                        Visit(relationalCollectionShaperExpression.InnerKeySelector),
+                        Visit(relationalCollectionShaperExpression.InnerShaper),
+                        relationalCollectionShaperExpression.Navigation);
                 }
 
                 return base.VisitExtension(extensionExpression);
